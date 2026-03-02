@@ -1,7 +1,7 @@
 [skill]
 name = "openpencil"
-version = "1.0.0"
-description = "Inspect, search, and export .fig design files from the command line using OpenPencil's headless CLI"
+version = "1.1.0"
+description = "Inspect, search, and export .fig design files — and run the OpenPencil web UI — from the command line"
 author = "aeschylus"
 category = "tool"
 
@@ -13,6 +13,8 @@ context_patterns = [
   "when user wants to inspect a design file",
   "when user wants to export a Figma file",
   "when user mentions openpencil",
+  "when user wants to start or stop the openpencil server",
+  "when user wants to open a design in the browser",
 ]
 
 [layering]
@@ -25,6 +27,8 @@ mcp_tools = [
   "openpencil_tree",
   "openpencil_find",
   "openpencil_export",
+  "openpencil_start_server",
+  "openpencil_stop_server",
 ]
 bot_commands = ["/fig", "/openpencil"]
 
@@ -39,5 +43,5 @@ system = ["bun"]
 api_keys = []
 
 [dependencies.runtime]
-# bun is required to run bunx @open-pencil/cli
+# bun is required to run bunx @open-pencil/cli and `bun run dev`
 # install from https://bun.sh

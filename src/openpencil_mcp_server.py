@@ -9,18 +9,22 @@ The CLI runs via `bunx @open-pencil/cli` — no server process needed.
 Bun must be installed: https://bun.sh
 
 Tools provided:
-- openpencil_info:   Document stats, node types, fonts
-- openpencil_tree:   Visual node hierarchy tree
-- openpencil_find:   Search nodes by name or type
-- openpencil_export: Render frames/nodes to PNG or JPG
+- openpencil_info:         Document stats, node types, fonts
+- openpencil_tree:         Visual node hierarchy tree
+- openpencil_find:         Search nodes by name or type
+- openpencil_export:       Render frames/nodes to PNG or JPG
+- openpencil_start_server: Spin up the OpenPencil web UI
+- openpencil_stop_server:  Shut down the OpenPencil web UI
 """
 
 import asyncio
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +37,18 @@ BUN_PATH = os.environ.get("OPENPENCIL_BUN_PATH", "bun")
 DEFAULT_EXPORT_FORMAT = os.environ.get("OPENPENCIL_EXPORT_FORMAT", "png")
 DEFAULT_SCALE = int(os.environ.get("OPENPENCIL_SCALE", "1"))
 DEFAULT_EXPORT_DIR = os.environ.get("OPENPENCIL_EXPORT_DIR", "")
+
+# Server hosting configuration
+DEFAULT_PORT = int(os.environ.get("OPENPENCIL_PORT", "1420"))
+OPENPENCIL_REPO_PATH = os.environ.get(
+    "OPENPENCIL_REPO_PATH",
+    str(Path.home() / "lobster-workspace" / "projects" / "open-pencil"),
+)
+
+# State file paths
+LOBSTER_STATE_DIR = Path.home() / ".lobster"
+PID_FILE = LOBSTER_STATE_DIR / "openpencil-server.pid"
+LOG_FILE = LOBSTER_STATE_DIR / "openpencil-server.log"
 
 CLI_PACKAGE = "@open-pencil/cli"
 
@@ -108,6 +124,90 @@ def _validate_fig_file(file_path: str) -> str | None:
     if p.suffix.lower() != ".fig":
         return f"Expected a .fig file, got: {p.suffix}"
     return None
+
+
+# =============================================================================
+# Server lifecycle helpers
+# =============================================================================
+
+def _read_pid() -> int | None:
+    """Read the stored PID from the state file. Returns None if absent or invalid."""
+    if not PID_FILE.exists():
+        return None
+    try:
+        raw = PID_FILE.read_text().strip()
+        return int(raw) if raw else None
+    except (ValueError, OSError):
+        return None
+
+
+def _write_pid(pid: int) -> None:
+    """Persist a PID to the state file, creating the parent directory if needed."""
+    LOBSTER_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(pid))
+
+
+def _remove_pid_file() -> None:
+    """Delete the PID file if it exists."""
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Return True if a process with the given PID currently exists."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we cannot signal it — treat as alive
+        return True
+
+
+def _kill_process_group(pid: int) -> str:
+    """
+    Terminate the process group rooted at pid.
+
+    Sends SIGTERM to the entire process group, waits up to 5 seconds, then
+    sends SIGKILL if the leader is still alive. Returns a human-readable
+    summary of what happened.
+
+    Only operates on the group associated with the tracked PID — never touches
+    any other Lobster system processes.
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return f"Process {pid} already gone"
+    except OSError as exc:
+        return f"Could not determine process group for PID {pid}: {exc}"
+
+    # SIGTERM to the whole group
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return f"Process group {pgid} already gone"
+    except PermissionError as exc:
+        return f"Permission denied killing process group {pgid}: {exc}"
+
+    # Wait up to 5 s for the leader to exit
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not _pid_is_alive(pid):
+            return f"Stopped (PID {pid}, group {pgid}) via SIGTERM"
+        time.sleep(0.2)
+
+    # Escalate to SIGKILL if still alive
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+        return f"Stopped (PID {pid}, group {pgid}) via SIGKILL after SIGTERM timeout"
+    except ProcessLookupError:
+        return f"Stopped (PID {pid}, group {pgid}) — exited before SIGKILL"
+    except PermissionError as exc:
+        return f"Could not SIGKILL process group {pgid}: {exc}"
 
 
 # =============================================================================
@@ -245,6 +345,50 @@ async def list_tools() -> list[Tool]:
                 "required": ["file"],
             },
         ),
+        Tool(
+            name="openpencil_start_server",
+            description=(
+                "Start the OpenPencil web UI (bun run dev) as a background process "
+                "detached from the MCP server lifecycle. "
+                "Returns the local URL once the server is running. "
+                "If the server is already running, returns the existing URL without "
+                "starting a second instance. "
+                "Output is logged to ~/.lobster/openpencil-server.log."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "port": {
+                        "type": "integer",
+                        "description": "Port to run the web UI on (default: 1420)",
+                        "default": 1420,
+                    },
+                    "repo_path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path to the OpenPencil source checkout. "
+                            "Defaults to ~/lobster-workspace/projects/open-pencil "
+                            "or OPENPENCIL_REPO_PATH env var."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="openpencil_stop_server",
+            description=(
+                "Stop the OpenPencil web UI that was started by openpencil_start_server. "
+                "Sends SIGTERM then SIGKILL to the tracked process group and removes the "
+                "PID state file. Safe to call even if the server is not running (idempotent). "
+                "Only terminates the OpenPencil process — never touches other Lobster processes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -258,7 +402,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     file_path = arguments.get("file", "")
     use_json = arguments.get("json", False)
 
-    # Validate .fig file for all tools
+    # Validate .fig file for file-based tools
     if name in ("openpencil_info", "openpencil_tree", "openpencil_find", "openpencil_export"):
         err = _validate_fig_file(file_path)
         if err:
@@ -326,11 +470,141 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             out = stdout.strip()
             return text_result(f"Export complete. Files written to: {output_dir}\n\n{out}")
 
+        elif name == "openpencil_start_server":
+            return _handle_start_server(arguments)
+
+        elif name == "openpencil_stop_server":
+            return _handle_stop_server()
+
         else:
             return error_result(f"Unknown tool: {name}")
 
     except Exception as e:
         return error_result(f"{type(e).__name__}: {e}")
+
+
+# =============================================================================
+# Server tool implementations
+# =============================================================================
+
+def _handle_start_server(arguments: dict[str, Any]) -> list[TextContent]:
+    """
+    Start the OpenPencil web UI as a detached background process.
+
+    Uses start_new_session=True so the child process gets its own session and
+    survives MCP server restarts. The PID is stored in ~/.lobster/openpencil-server.pid
+    and all output (stdout + stderr) is appended to ~/.lobster/openpencil-server.log.
+
+    If a live process is already tracked, returns immediately with the existing URL.
+    """
+    port = int(arguments.get("port", DEFAULT_PORT))
+    repo_path = Path(arguments.get("repo_path") or OPENPENCIL_REPO_PATH)
+    url = f"http://localhost:{port}"
+
+    # Check whether a previously started server is still alive
+    existing_pid = _read_pid()
+    if existing_pid is not None:
+        if _pid_is_alive(existing_pid):
+            return text_result(
+                f"OpenPencil server is already running (PID {existing_pid}).\n"
+                f"URL: {url}\n"
+                f"Log: {LOG_FILE}"
+            )
+        else:
+            # Stale PID — clean it up and start fresh
+            _remove_pid_file()
+
+    # Validate the repo directory
+    if not repo_path.is_dir():
+        return error_result(
+            f"OpenPencil repo not found at: {repo_path}\n"
+            "Set the repo_path argument or the OPENPENCIL_REPO_PATH environment variable "
+            "to the directory containing the OpenPencil source checkout."
+        )
+
+    bun = _find_bun()
+    if not bun:
+        return error_result(
+            "bun not found. Install from https://bun.sh or set the bun_path preference.\n"
+            "Quick install: curl -fsSL https://bun.sh/install | bash"
+        )
+
+    # Prepare environment: forward current env and inject the port
+    env = os.environ.copy()
+    env["PORT"] = str(port)
+
+    # Open log file in append mode
+    LOBSTER_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        log_fd = open(LOG_FILE, "a")
+    except OSError as exc:
+        return error_result(f"Cannot open log file {LOG_FILE}: {exc}")
+
+    try:
+        proc = subprocess.Popen(
+            [bun, "run", "dev"],
+            cwd=str(repo_path),
+            env=env,
+            stdout=log_fd,
+            stderr=log_fd,
+            # Detach from the MCP server's process group so the child survives
+            # an MCP restart without being caught by SIGHUP or group signals.
+            start_new_session=True,
+            # Ensure stdin is not inherited (avoids blocking on terminal input)
+            stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        log_fd.close()
+        return error_result(f"Could not execute bun at: {bun}")
+    except OSError as exc:
+        log_fd.close()
+        return error_result(f"Failed to start server: {exc}")
+    finally:
+        # The child has inherited the fd; close our copy so we don't leak it.
+        log_fd.close()
+
+    _write_pid(proc.pid)
+
+    return text_result(
+        f"OpenPencil server started (PID {proc.pid}).\n"
+        f"URL:  {url}\n"
+        f"Log:  {LOG_FILE}\n"
+        f"Repo: {repo_path}\n"
+        "\n"
+        "The server runs detached — it will survive MCP restarts.\n"
+        "Call openpencil_stop_server to shut it down."
+    )
+
+
+def _handle_stop_server() -> list[TextContent]:
+    """
+    Stop the tracked OpenPencil server process.
+
+    Reads the PID from ~/.lobster/openpencil-server.pid, terminates the entire
+    process group (SIGTERM, then SIGKILL after 5 s if needed), and removes the
+    state file. Safe to call when nothing is running.
+    """
+    pid = _read_pid()
+
+    if pid is None:
+        return text_result(
+            "OpenPencil server is not running (no PID file found). Nothing to stop."
+        )
+
+    if not _pid_is_alive(pid):
+        _remove_pid_file()
+        return text_result(
+            f"OpenPencil server (PID {pid}) was already stopped. Cleaned up stale PID file."
+        )
+
+    summary = _kill_process_group(pid)
+    _remove_pid_file()
+
+    return text_result(
+        f"OpenPencil server stopped.\n"
+        f"Details: {summary}\n"
+        f"Log preserved at: {LOG_FILE}"
+    )
 
 
 # =============================================================================

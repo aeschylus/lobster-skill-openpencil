@@ -1,8 +1,8 @@
 # lobster-skill-openpencil
 
-**Inspect, search, and export `.fig` design files — powered by [OpenPencil](https://openpencil.dev).**
+**Inspect, search, and export `.fig` design files — and run the OpenPencil web UI — powered by [OpenPencil](https://openpencil.dev).**
 
-This Lobster skill gives your AI assistant the ability to work with Figma `.fig` files from the command line, no GUI required. It wraps the [OpenPencil headless CLI](https://github.com/open-pencil/open-pencil) (`@open-pencil/cli`) as MCP tools.
+This Lobster skill gives your AI assistant the ability to work with Figma `.fig` files from the command line, no GUI required. It wraps the [OpenPencil headless CLI](https://github.com/open-pencil/open-pencil) (`@open-pencil/cli`) as MCP tools, and can also spin up the full OpenPencil web UI on demand.
 
 ## What You Can Do
 
@@ -11,6 +11,8 @@ This Lobster skill gives your AI assistant the ability to work with Figma `.fig`
 - **"Find all Button components in design.fig"** — Search by node name or type
 - **"Export all frames from design.fig as PNG"** — Render frames to PNG or JPG without opening a GUI
 - **"Export the Login screen at 2x scale"** — Retina-quality exports by node ID
+- **"Start openpencil"** — Launch the OpenPencil web UI in the background; get a browser-ready URL
+- **"Stop openpencil"** — Cleanly shut down the web UI
 
 ## Installation
 
@@ -60,13 +62,13 @@ activate_skill('openpencil')
 ## Tools
 
 | Tool | What It Does |
-|------|-------------|
+|------|--------------|
 | `openpencil_info` | Document stats: node count, types, fonts, frame names |
 | `openpencil_tree` | Full visual layer hierarchy |
 | `openpencil_find` | Search nodes by name or type |
 | `openpencil_export` | Render frames/nodes to PNG or JPG |
-
-All tools accept a `json: true` parameter for machine-readable output.
+| `openpencil_start_server` | Start the OpenPencil web UI in the background |
+| `openpencil_stop_server` | Cleanly shut down the web UI |
 
 ### `openpencil_export` Options
 
@@ -79,6 +81,23 @@ All tools accept a `json: true` parameter for machine-readable output.
 | `quality` | `90` | JPEG quality 0-100 (JPG only) |
 | `node_id` | all frames | Export a specific node by ID |
 
+### `openpencil_start_server` Options
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `port` | `1420` | Port for the web UI |
+| `repo_path` | `~/lobster-workspace/projects/open-pencil` | Path to OpenPencil source checkout |
+
+The server runs as a detached background process — it survives MCP restarts and does not block the Lobster system. Output is logged to `~/.lobster/openpencil-server.log`. The PID is tracked in `~/.lobster/openpencil-server.pid`.
+
+Calling `openpencil_start_server` when a server is already running returns the existing URL without starting a second instance.
+
+### `openpencil_stop_server`
+
+No parameters required. Reads the tracked PID, sends SIGTERM (then SIGKILL if needed), and removes the state file. Safe to call even when nothing is running — it is fully idempotent.
+
+Only the tracked OpenPencil process group is terminated. No other Lobster processes are affected.
+
 ## Preferences
 
 Set via Lobster's `set_skill_preference` tool:
@@ -90,26 +109,38 @@ Set via Lobster's `set_skill_preference` tool:
 | `default_export_dir` | `""` | Default output directory |
 | `bun_path` | `bun` | Path to bun if not on PATH |
 
+The server port and repo path can also be configured via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENPENCIL_PORT` | `1420` | Default port for the web UI |
+| `OPENPENCIL_REPO_PATH` | `~/lobster-workspace/projects/open-pencil` | Default path to OpenPencil source |
+
 ## Architecture
 
 ```
 Lobster (Claude Code)
   |
   |-- MCP: openpencil_info, openpencil_tree, openpencil_find, openpencil_export
+  |-- MCP: openpencil_start_server, openpencil_stop_server
   |
   v
 openpencil_mcp_server.py  (Python MCP wrapper — runs in Lobster's venv)
   |
-  |-- subprocess
+  |-- subprocess (CLI tools)
+  |   v
+  |   bunx @open-pencil/cli  (OpenPencil headless CLI — fresh subprocess per call)
+  |     v
+  |     .fig file  (local Figma design file)
   |
-  v
-bunx @open-pencil/cli  (OpenPencil headless CLI — runs via Bun)
-  |
-  v
-.fig file  (local Figma design file)
+  |-- subprocess.Popen (web UI — detached, start_new_session=True)
+      v
+      bun run dev  (OpenPencil web UI — survives MCP restarts)
+        v
+        http://localhost:1420
 ```
 
-No server process needed — each CLI call is a fresh subprocess invocation.
+CLI tools spin up a fresh subprocess per invocation — no persistent state. The web UI is a long-lived detached process tracked by PID file.
 
 ## About OpenPencil
 
@@ -120,7 +151,7 @@ No server process needed — each CLI call is a fresh subprocess invocation.
 - AI-native with built-in chat (bring your own API key)
 - ~7 MB install
 
-The headless CLI (`@open-pencil/cli`) is the component this skill uses — it enables scriptable design file operations in CI/CD pipelines, automation, and AI assistant workflows.
+The headless CLI (`@open-pencil/cli`) is the component used by the inspection/export tools. The `bun run dev` command starts the full interactive web UI for browser-based design editing.
 
 ## License
 
