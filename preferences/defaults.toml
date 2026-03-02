@@ -1,0 +1,4 @@
+default_export_format = "png"
+default_scale = 1
+default_export_dir = ""
+bun_path = "bun"

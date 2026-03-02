@@ -1,0 +1,15 @@
+[default_export_format]
+type = "string"
+description = "Default export format: png or jpg"
+
+[default_scale]
+type = "integer"
+description = "Default export scale factor (1 = 1x, 2 = Retina/2x)"
+
+[default_export_dir]
+type = "string"
+description = "Default directory to write exported images to (absolute path)"
+
+[bun_path]
+type = "string"
+description = "Path to bun binary if not on PATH (e.g., /home/user/.bun/bin/bun)"
